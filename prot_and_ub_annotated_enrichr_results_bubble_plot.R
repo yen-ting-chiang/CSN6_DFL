@@ -57,7 +57,7 @@ library(gtable)
 #   9 = Orange to Teal          : low="#FF8C00", high="#008080"
 #  10 = Yellow-Green to Purple  : low="#9ACD32", high="#9932CC"
 
-palette_bubble_choices <- c(9,10)  # Provide a vector of numbers to select multiple bubble palettes (e.g., c(1, 6, 8, 9, 10))
+palette_bubble_choices <- c(10)  # Provide a vector of numbers to select multiple bubble palettes (e.g., c(1, 6, 8, 9, 10))
 
 bubble_palettes <- list(
   c("#E64B35", "#4DBBD5"),  # 1: NPG Red to Blue
@@ -439,15 +439,15 @@ jaccard_threshold <- 0.1
 
 # Enrichment map node color palette (same numbering as bubble palettes above)
 # Provide a vector of numbers to select multiple emapplot palettes.
-emapplot_palette_choices <- c(10)
+emapplot_palette_choices <- c(1,2,3,4,5,6,7,8,9,10)
 
 # Enrichment map dynamic sizing parameters (inches)
 # The plot area scales with sqrt(n_terms) so that nodes and their labels have
 # enough room to spread out without overlapping. The total output size is then
 # measured from a temporary render to accommodate legend and title.
 emapplot_spacing_per_node <- 0.7  # inches of spacing per sqrt(n_terms)
-emapplot_min_panel_size   <- 2.0  # minimum panel width or height (inches)
-emapplot_label_font_size  <- 2.5  # pt (must match geom_node_text size below)
+emapplot_min_panel_size   <- 2.2  # minimum panel width or height (inches)
+emapplot_label_font_size  <- 3  # pt (must match geom_node_text size below)
 
 cat("\n")
 cat("========================================\n")
@@ -609,7 +609,7 @@ for (xlsx_path in xlsx_files) {
       # Extra width is added for the longest label text.
       max_label_nchar <- max(nchar(as.character(emap_df$Term)))
       # Estimate longest label width: ~0.07 inches per character at size 2.5
-      label_width_est <- max_label_nchar * 0.07
+      label_width_est <- max_label_nchar * 0.084
       base_panel_size <- max(emapplot_min_panel_size,
                              sqrt(n_terms) * emapplot_spacing_per_node)
       dynamic_panel_width  <- base_panel_size + label_width_est
