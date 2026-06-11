@@ -711,3 +711,603 @@ for (xlsx_path in xlsx_files) {
 
 cat("All enrichment maps have been generated successfully.\n")
 cat("Output directory:", emapplot_output_dir, "\n")
+
+# ==============================================================================
+# PART 3: Gene-Concept Network (cnetplot)
+# ==============================================================================
+# For each .xlsx file and each worksheet, build a gene-concept network from the
+# same green-highlighted terms used for bubble plots. This is a bipartite network:
+#   - Term nodes: colored by -log10(Adjusted P-value), sized proportional to gene count
+#   - Gene nodes: smaller, uniform color
+#   - Edges: connect each term to its associated genes
+# Genes shared by multiple terms create hub connections in the network.
+#
+# Uses igraph + ggraph (same rationale as emapplot: data is from external Enrichr
+# results, not clusterProfiler enrichResult objects).
+#
+# Output:
+#   prot_and_ub_annotated_enrichr_results/cnetplot/
+#     {xlsx_basename}_{sheet_name}_cnetplot.pdf
+#     {xlsx_basename}_{sheet_name}_cnetplot.tiff
+
+# ==============================================================================
+# USER CONFIGURATION: Gene-Concept Network Parameters
+# ==============================================================================
+
+# Cnetplot node color palette (same numbering as bubble palettes above)
+# Provide a vector of numbers to select multiple cnetplot palettes.
+cnetplot_palette_choices <- c(9, 10)
+
+# Cnetplot dynamic sizing parameters (inches)
+cnetplot_spacing_per_node <- 0.55  # inches of spacing per sqrt(total nodes)
+cnetplot_min_panel_size   <- 4.0   # minimum panel width or height (inches)
+cnetplot_term_font_size   <- 2.8   # pt for Term node labels
+cnetplot_gene_font_size   <- 2.0   # pt for Gene node labels
+cnetplot_gene_node_color  <- "grey70"  # color for gene nodes
+
+cat("\n")
+cat("========================================\n")
+cat("Part 3: Gene-Concept Network (cnetplot)\n")
+cat("========================================\n")
+cat("Cnetplot palettes:", paste(cnetplot_palette_choices, collapse = ", "), "\n")
+
+# Setup output directory for cnetplot
+cnetplot_output_dir <- file.path(input_dir, "cnetplot")
+if (!dir.exists(cnetplot_output_dir)) {
+  dir.create(cnetplot_output_dir, recursive = TRUE)
+}
+
+# ==============================================================================
+# Cnetplot Processing Loop
+# ==============================================================================
+
+for (xlsx_path in xlsx_files) {
+  xlsx_basename <- tools::file_path_sans_ext(basename(xlsx_path))
+  cat("\nProcessing (cnetplot):", xlsx_basename, "\n")
+
+  wb <- loadWorkbook(xlsx_path)
+  sheet_names <- getSheetNames(xlsx_path)
+
+  for (sheet_name in sheet_names) {
+    cat("  Sheet:", sheet_name, "\n")
+
+    df <- read.xlsx(xlsx_path, sheet = sheet_name)
+
+    if (is.null(df) || nrow(df) == 0) {
+      cat("    -> Empty sheet, skipping.\n")
+      next
+    }
+
+    highlighted_rows <- get_highlighted_term_rows(wb, sheet_name)
+
+    if (length(highlighted_rows) == 0) {
+      cat("    -> No highlighted Term rows found, skipping.\n")
+      next
+    }
+
+    cnet_df <- df[highlighted_rows, , drop = FALSE]
+
+    # Map column names
+    col_names <- colnames(cnet_df)
+    padj_col  <- grep("^Adjusted[.]P", col_names, value = TRUE)[1]
+    odds_col  <- grep("^Odds[.]Ratio", col_names, value = TRUE)[1]
+    genes_col <- "Genes"
+
+    if (is.na(padj_col) || is.na(odds_col)) {
+      cat("    -> Required columns not found, skipping.\n")
+      next
+    }
+
+    cnet_df$Count <- sapply(cnet_df[[genes_col]], count_genes)
+    cnet_df$neg_log10_padj <- -log10(as.numeric(cnet_df[[padj_col]]))
+
+    cnet_df <- cnet_df[!is.na(cnet_df$neg_log10_padj) &
+                        !is.na(cnet_df$Term), ]
+
+    if (nrow(cnet_df) == 0) {
+      cat("    -> No valid data after filtering, skipping.\n")
+      next
+    }
+
+    # Clean Term labels (same rules as bubble plots)
+    if (grepl("WikiPathways", sheet_name, ignore.case = TRUE)) {
+      cnet_df$Term <- trimws(gsub("\\s*WP\\d+$", "", cnet_df$Term))
+    }
+    if (grepl("GO_Biological_Process", sheet_name, ignore.case = TRUE)) {
+      cnet_df$Term <- trimws(gsub("\\s*\\(GO:\\d+\\)$", "", cnet_df$Term))
+    }
+
+    # Build bipartite edge list: Term -> Gene
+    cnet_edges <- data.frame(from = character(0), to = character(0),
+                              stringsAsFactors = FALSE)
+    for (i in seq_len(nrow(cnet_df))) {
+      genes <- parse_genes(cnet_df[[genes_col]][i])
+      if (length(genes) > 0) {
+        cnet_edges <- rbind(cnet_edges, data.frame(
+          from = cnet_df$Term[i], to = genes,
+          stringsAsFactors = FALSE
+        ))
+      }
+    }
+
+    if (nrow(cnet_edges) == 0) {
+      cat("    -> No gene associations found, skipping.\n")
+      next
+    }
+
+    # Collect all unique genes
+    all_genes <- unique(cnet_edges$to)
+
+    # Build node data frame with type info
+    term_nodes <- data.frame(
+      name = cnet_df$Term,
+      node_type = "Term",
+      node_size = cnet_df$Count,
+      neg_log10_padj = cnet_df$neg_log10_padj,
+      stringsAsFactors = FALSE
+    )
+    gene_nodes <- data.frame(
+      name = all_genes,
+      node_type = "Gene",
+      node_size = 1,
+      neg_log10_padj = NA_real_,
+      stringsAsFactors = FALSE
+    )
+    all_nodes <- rbind(term_nodes, gene_nodes)
+
+    # Build igraph network
+    g_cnet <- graph_from_data_frame(cnet_edges, directed = FALSE,
+                                     vertices = all_nodes)
+
+    # Total node count for dynamic sizing
+    total_nodes <- nrow(all_nodes)
+    n_terms_cnet <- nrow(term_nodes)
+
+    # Generate output filename
+    safe_sheet_name <- gsub("[^A-Za-z0-9_]", "_", sheet_name)
+    cnet_file_prefix <- paste0(xlsx_basename, "_", safe_sheet_name)
+
+    for (palette_choice in cnetplot_palette_choices) {
+      cnet_color_low  <- bubble_palettes[[palette_choice]][1]
+      cnet_color_high <- bubble_palettes[[palette_choice]][2]
+
+      # Create specific subdirectory for this palette
+      palette_dir <- file.path(cnetplot_output_dir,
+                                palette_names[palette_choice])
+      if (!dir.exists(palette_dir)) {
+        dir.create(palette_dir, recursive = TRUE)
+      }
+
+      # Calculate dynamic panel dimensions based on total node count
+      max_term_nchar <- max(nchar(as.character(cnet_df$Term)))
+      max_gene_nchar <- max(nchar(as.character(all_genes)))
+      max_label_nchar <- max(max_term_nchar, max_gene_nchar)
+      label_width_est <- max_label_nchar * 0.06
+      base_panel_size <- max(cnetplot_min_panel_size,
+                             sqrt(total_nodes) * cnetplot_spacing_per_node)
+      dynamic_cnet_width  <- base_panel_size + label_width_est
+      dynamic_cnet_height <- base_panel_size
+
+      # Build cnetplot using ggraph
+      set.seed(42)
+      cnet_plot <- ggraph(g_cnet, layout = "fr") +
+        geom_edge_link(alpha = 0.25, color = "grey70") +
+        # Gene nodes (no color mapping, fixed color)
+        geom_node_point(
+          data = function(x) x[x$node_type == "Gene", ],
+          aes(size = node_size),
+          color = cnetplot_gene_node_color, show.legend = FALSE
+        ) +
+        # Term nodes (colored by -log10 padj)
+        geom_node_point(
+          data = function(x) x[x$node_type == "Term", ],
+          aes(size = node_size, color = neg_log10_padj)
+        ) +
+        # Gene labels
+        geom_node_text(
+          data = function(x) x[x$node_type == "Gene", ],
+          aes(label = name), repel = TRUE,
+          size = cnetplot_gene_font_size, color = "black",
+          max.overlaps = Inf,
+          box.padding = unit(0.35, "lines"),
+          point.padding = unit(0.3, "lines"),
+          force = 2, force_pull = 0.5,
+          segment.color = "grey80", segment.size = 0.2
+        ) +
+        # Term labels (bold)
+        geom_node_text(
+          data = function(x) x[x$node_type == "Term", ],
+          aes(label = name), repel = TRUE,
+          size = cnetplot_term_font_size, fontface = "bold",
+          max.overlaps = Inf,
+          box.padding = unit(0.5, "lines"),
+          point.padding = unit(0.3, "lines"),
+          force = 3, force_pull = 0.3,
+          segment.color = "grey60", segment.size = 0.3
+        ) +
+        scale_color_gradient(low = cnet_color_high, high = cnet_color_low,
+                             name = expression(-log[10](Adjusted~P-value))) +
+        scale_size_continuous(name = "Count", range = c(1, 6),
+                              guide = guide_legend(
+                                override.aes = list(color = "black"))) +
+        labs(title = paste0(xlsx_basename, "\n", sheet_name)) +
+        theme_void() +
+        theme(
+          plot.background = element_rect(fill = "white", color = NA),
+          plot.title = element_text(size = 9, face = "bold", hjust = 0.5,
+                                    color = "black"),
+          legend.title = element_text(size = 7, face = "bold", color = "black"),
+          legend.text = element_text(size = 7, color = "black"),
+          legend.position = "right",
+          legend.key.size = unit(0.4, "cm"),
+          legend.spacing.y = unit(0.1, "cm"),
+          plot.margin = margin(10, 10, 10, 10)
+        )
+
+      # Convert to gtable and set dynamic panel dimensions
+      g_cnet_grob <- ggplotGrob(cnet_plot)
+      panel_pos_cnet <- g_cnet_grob$layout[g_cnet_grob$layout$name == "panel", ]
+      g_cnet_grob$widths[panel_pos_cnet$l]  <- unit(dynamic_cnet_width, "in")
+      g_cnet_grob$heights[panel_pos_cnet$t] <- unit(dynamic_cnet_height, "in")
+
+      # Measure total output dimensions using a temporary PDF device
+      tmp_pdf <- tempfile(fileext = ".pdf")
+      pdf(tmp_pdf, width = 20, height = 20)
+      grid.newpage()
+      grid.draw(g_cnet_grob)
+
+      # Check if the legend is taller than the panel
+      legend_rows_cnet <- g_cnet_grob$layout[
+        grepl("guide-box", g_cnet_grob$layout$name), ]
+      if (nrow(legend_rows_cnet) > 0) {
+        legend_height_cnet <- convertHeight(
+          sum(g_cnet_grob$heights[seq(min(legend_rows_cnet$t),
+                                       max(legend_rows_cnet$b))]),
+          "in", valueOnly = TRUE
+        )
+        if (legend_height_cnet > dynamic_cnet_height) {
+          dynamic_cnet_height <- legend_height_cnet
+          g_cnet_grob$heights[panel_pos_cnet$t] <- unit(dynamic_cnet_height,
+                                                         "in")
+        }
+      }
+
+      total_cnet_width  <- convertWidth(sum(g_cnet_grob$widths), "in",
+                                         valueOnly = TRUE)
+      total_cnet_height <- convertHeight(sum(g_cnet_grob$heights), "in",
+                                          valueOnly = TRUE)
+      dev.off()
+      unlink(tmp_pdf)
+
+      # Save as PDF
+      pdf(file.path(palette_dir,
+                    paste0(cnet_file_prefix, "_cnetplot.pdf")),
+          width = total_cnet_width, height = total_cnet_height)
+      grid.newpage()
+      grid.draw(g_cnet_grob)
+      dev.off()
+
+      # Save as TIFF
+      tiff(file.path(palette_dir,
+                     paste0(cnet_file_prefix, "_cnetplot.tiff")),
+           width = total_cnet_width, height = total_cnet_height,
+           units = "in", res = 300, compression = "lzw")
+      grid.newpage()
+      grid.draw(g_cnet_grob)
+      dev.off()
+
+      cat("    -> Cnetplot saved:", cnet_file_prefix,
+          "(palette", palette_choice, ", panel:",
+          round(dynamic_cnet_width, 2), "x",
+          round(dynamic_cnet_height, 2),
+          "in, total:", round(total_cnet_width, 2), "x",
+          round(total_cnet_height, 2), "in)\n")
+    }
+  }
+
+  cat("\n")
+}
+
+cat("All gene-concept networks have been generated successfully.\n")
+cat("Output directory:", cnetplot_output_dir, "\n")
+
+# ==============================================================================
+# PART 4: UpSet Plot
+# ==============================================================================
+# For each .xlsx file and each worksheet, build an UpSet plot from the same
+# green-highlighted terms used for bubble/emapplot/cnetplot. The UpSet plot
+# visualizes intersections of gene sets across enriched terms:
+#   - Each "set" is one enriched Term
+#   - Bars show the size of each intersection (shared genes between term combos)
+#   - Bottom-left matrix dots show which terms participate in each intersection
+#
+# Uses UpSetR package (designed specifically for set intersection visualization,
+# superior to Venn diagrams when there are more than 3-4 sets).
+#
+# Output:
+#   prot_and_ub_annotated_enrichr_results/upsetplot/
+#     {xlsx_basename}_{sheet_name}_upsetplot.pdf
+#     {xlsx_basename}_{sheet_name}_upsetplot.tiff
+
+# ==============================================================================
+# USER CONFIGURATION: UpSet Plot Parameters
+# ==============================================================================
+
+# Load ComplexUpset (ggplot2-based, publication-quality UpSet plots)
+if (!requireNamespace("ComplexUpset", quietly = TRUE)) {
+  install.packages("ComplexUpset")
+}
+library(ComplexUpset)
+
+# Maximum number of intersections to display (sorted by size, largest first)
+upset_n_intersections <- 40
+
+# Minimum intersection size to display
+upset_min_size <- 1
+
+# Define color palettes for UpSet plots
+upset_palettes <- list(
+  list(name = "palette_1", bar_color = "red",     set_bar_color = "#E8833A", dot_color = "#2D2D2D", inactive_dot = "#E0E0E0"),
+  list(name = "palette_2", bar_color = "#4E79A7", set_bar_color = "#F28E2B", dot_color = "#4E79A7", inactive_dot = "#E0E0E0"),
+  list(name = "palette_3", bar_color = "#59A14F", set_bar_color = "#8CD17D", dot_color = "#59A14F", inactive_dot = "#E0E0E0"),
+  list(name = "palette_4", bar_color = "#B07AA1", set_bar_color = "#FF9DA7", dot_color = "#B07AA1", inactive_dot = "#E0E0E0"),
+  list(name = "palette_5", bar_color = "#76B7B2", set_bar_color = "#EDC948", dot_color = "#76B7B2", inactive_dot = "#E0E0E0")
+)
+
+# Choose which palettes to use (1 to 5). You can select multiple, e.g., c(1, 2, 3, 4, 5)
+upsetplot_palette_choices <- c(1, 2, 3, 4, 5)
+
+# Dynamic sizing parameters
+upset_width_per_intersection  <- 0.1  # inches per intersection column (fixed, minimal)
+upset_height_per_set          <- 0.15  # inches per set row (fixed, minimal)
+upset_min_width               <- 2.0   # minimum output width (inches)
+upset_min_height              <- 2.0   # minimum output height (inches)
+
+cat("\n")
+cat("========================================\n")
+cat("Part 4: UpSet Plot\n")
+cat("========================================\n")
+cat("Max intersections:", upset_n_intersections, "\n")
+
+# Setup output directory for upsetplot
+upsetplot_output_dir <- file.path(input_dir, "upsetplot")
+if (!dir.exists(upsetplot_output_dir)) {
+  dir.create(upsetplot_output_dir, recursive = TRUE)
+}
+
+# ==============================================================================
+# UpSet Plot Processing Loop
+# ==============================================================================
+
+for (xlsx_path in xlsx_files) {
+  xlsx_basename <- tools::file_path_sans_ext(basename(xlsx_path))
+  cat("\nProcessing (upsetplot):", xlsx_basename, "\n")
+
+  wb <- loadWorkbook(xlsx_path)
+  sheet_names <- getSheetNames(xlsx_path)
+
+  for (sheet_name in sheet_names) {
+    cat("  Sheet:", sheet_name, "\n")
+
+    df <- read.xlsx(xlsx_path, sheet = sheet_name)
+
+    if (is.null(df) || nrow(df) == 0) {
+      cat("    -> Empty sheet, skipping.\n")
+      next
+    }
+
+    highlighted_rows <- get_highlighted_term_rows(wb, sheet_name)
+
+    if (length(highlighted_rows) == 0) {
+      cat("    -> No highlighted Term rows found, skipping.\n")
+      next
+    }
+
+    upset_df <- df[highlighted_rows, , drop = FALSE]
+
+    # Map column names
+    col_names <- colnames(upset_df)
+    padj_col  <- grep("^Adjusted[.]P", col_names, value = TRUE)[1]
+    genes_col <- "Genes"
+
+    if (is.na(padj_col)) {
+      cat("    -> Required columns not found, skipping.\n")
+      next
+    }
+
+    upset_df <- upset_df[!is.na(upset_df$Term), ]
+
+    if (nrow(upset_df) < 2) {
+      cat("    -> Less than 2 valid terms, skipping UpSet plot.\n")
+      next
+    }
+
+    # Clean Term labels (same rules as bubble plots)
+    if (grepl("WikiPathways", sheet_name, ignore.case = TRUE)) {
+      upset_df$Term <- trimws(gsub("\\s*WP\\d+$", "", upset_df$Term))
+    }
+    if (grepl("GO_Biological_Process", sheet_name, ignore.case = TRUE)) {
+      upset_df$Term <- trimws(gsub("\\s*\\(GO:\\d+\\)$", "", upset_df$Term))
+    }
+
+    # Parse gene lists for each term
+    gene_lists_upset <- lapply(upset_df[[genes_col]], parse_genes)
+    names(gene_lists_upset) <- upset_df$Term
+
+    # Remove terms with zero genes
+    gene_lists_upset <- gene_lists_upset[sapply(gene_lists_upset, length) > 0]
+
+    if (length(gene_lists_upset) < 2) {
+      cat("    -> Less than 2 terms with genes, skipping.\n")
+      next
+    }
+
+    # Build binary membership data frame (rows = genes, cols = terms)
+    all_genes_upset <- unique(unlist(gene_lists_upset))
+    membership_matrix <- data.frame(
+      gene = all_genes_upset,
+      stringsAsFactors = FALSE
+    )
+    for (term_name in names(gene_lists_upset)) {
+      membership_matrix[[term_name]] <- as.integer(
+        all_genes_upset %in% gene_lists_upset[[term_name]]
+      )
+    }
+
+    set_names <- setdiff(colnames(membership_matrix), "gene")
+    n_sets <- length(set_names)
+    n_genes_total <- nrow(membership_matrix)
+
+    # Dynamically measure the longest term label width for Arial size 7
+    longest_term_upset <- set_names[which.max(nchar(set_names))]
+    max_label_width_in_upset <- grid::convertWidth(
+      grid::grobWidth(grid::textGrob(longest_term_upset, gp = grid::gpar(fontsize = 7, fontfamily = "Arial"))),
+      "inches", valueOnly = TRUE
+    )
+    
+    # Set fixed panel dimensions for the Set Size bar plot and Intersection Matrix
+    upset_set_size_width <- 1.0  # Fixed width for the Set Size bar plot
+    n_display <- min(upset_n_intersections, 2^n_sets - 1)
+    upset_matrix_width <- n_display * upset_width_per_intersection
+    
+    # Calculate width ratio as a proportion (ComplexUpset uses width_ratio as the fraction for the Set Size plot)
+    calculated_width_ratio <- upset_set_size_width / (upset_matrix_width + upset_set_size_width)
+
+    # Set fixed heights for the matrix and the top bar plot
+    upset_matrix_height  <- n_sets * upset_height_per_set
+    upset_top_bar_height <- 0.8  # Fixed to 0.8 inches (approx. 1/3 of previous size)
+    
+    # Calculate height ratio for ComplexUpset (matrix_height / top_bar_height)
+    calculated_height_ratio <- upset_matrix_height / upset_top_bar_height
+
+    # Calculate exact dynamic output dimensions WITHOUT max() limits to prevent panel stretching
+    # We add 0.5 inches for margins to prevent ggsave from squishing the panels
+    dynamic_upset_width  <- upset_matrix_width + upset_set_size_width + max_label_width_in_upset + 0.5
+    dynamic_upset_height <- upset_matrix_height + upset_top_bar_height + 0.5
+
+    # Base theme for Arial size 7
+    upset_base_theme <- theme(
+      text             = element_text(family = "Arial", size = 7, color = "black"),
+      axis.title       = element_text(family = "Arial", size = 7, face = "bold", color = "black"),
+      axis.text        = element_text(family = "Arial", size = 7, color = "black"),
+      panel.background = element_rect(fill = "white", color = NA),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.background  = element_rect(fill = "white", color = NA),
+      axis.ticks       = element_line(color = "grey50", linewidth = 0.3)
+    )
+
+    # Loop over selected palettes
+    for (palette_choice in upsetplot_palette_choices) {
+      if (palette_choice < 1 || palette_choice > length(upset_palettes)) {
+        cat("    -> Invalid palette choice:", palette_choice, "skipping.\n")
+        next
+      }
+      
+      current_palette <- upset_palettes[[palette_choice]]
+      upset_bar_color     <- current_palette$bar_color
+      upset_set_bar_color <- current_palette$set_bar_color
+      upset_dot_color     <- current_palette$dot_color
+      upset_inactive_dot  <- current_palette$inactive_dot
+      
+      palette_dir <- file.path(upsetplot_output_dir, paste0("palette_", palette_choice))
+      if (!dir.exists(palette_dir)) {
+        dir.create(palette_dir, recursive = TRUE)
+      }
+
+      # Generate output filename
+      safe_sheet_name <- gsub("[^A-Za-z0-9_]", "_", sheet_name)
+      upset_file_prefix <- paste0(xlsx_basename, "_", safe_sheet_name)
+
+      # Build publication-quality UpSet plot using ComplexUpset
+      upset_plot <- ComplexUpset::upset(
+        data = membership_matrix,
+        intersect = set_names,
+        name = NULL,
+        min_size = upset_min_size,
+        n_intersections = upset_n_intersections,
+        sort_sets = "descending",
+        sort_intersections = "descending",
+        sort_intersections_by = c("degree", "cardinality"),
+        width_ratio = calculated_width_ratio,
+        height_ratio = calculated_height_ratio,
+        wrap = FALSE,
+        set_sizes = (
+          upset_set_size(
+            geom = geom_bar(
+              fill = upset_set_bar_color,
+              width = 0.65
+            ),
+            position = "right"
+          )
+          + upset_base_theme
+          + theme(plot.margin = margin(0, 2, 0, 2))
+          + xlab("Set Size")
+        ),
+        base_annotations = list(
+          "Intersection Size" = intersection_size(
+            text = list(size = 7 / ggplot2::.pt, vjust = -0.3, family = "Arial"),
+            bar_number_threshold = 1,
+            mapping = aes(fill = "bars")
+          )
+          + scale_fill_manual(values = c("bars" = upset_bar_color),
+                              guide = "none")
+          + scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+          + upset_base_theme
+          + theme(plot.margin = margin(2, 2, 0, 2))
+          + ylab("Intersection\nSize")
+        ),
+        matrix = intersection_matrix(
+          geom = geom_point(size = 1.8, shape = 16),
+          segment = geom_segment(linewidth = 0.6),
+          outline_color = list(active = upset_dot_color,
+                                inactive = upset_inactive_dot)
+        ),
+        stripes = upset_stripes(
+          colors = c("white", "grey97")
+        ),
+        themes = upset_modify_themes(list(
+          "intersections_matrix" = upset_base_theme + theme(
+            axis.text.y = element_text(size = 7, face = "bold", family = "Arial", color = "black", hjust = 1),
+            plot.margin = margin(0, 0, 0, 0)
+          )
+        ))
+      )
+
+      # Save as PDF
+      ggsave(
+        filename = file.path(palette_dir,
+                             paste0(upset_file_prefix, "_upsetplot.pdf")),
+        plot = upset_plot,
+        width = dynamic_upset_width,
+        height = dynamic_upset_height,
+        units = "in",
+        device = "pdf"
+      )
+
+      # Save as TIFF
+      ggsave(
+        filename = file.path(palette_dir,
+                             paste0(upset_file_prefix, "_upsetplot.tiff")),
+        plot = upset_plot,
+        width = dynamic_upset_width,
+        height = dynamic_upset_height,
+        units = "in",
+        dpi = 300,
+        device = "tiff",
+        compression = "lzw"
+      )
+
+      cat("    -> UpSet plot saved (palette", palette_choice, "):", upset_file_prefix,
+          "(", n_sets, "sets,", n_genes_total, "genes,",
+          round(dynamic_upset_width, 2), "x",
+          round(dynamic_upset_height, 2), "in)\n")
+    }
+  }
+
+  cat("\n")
+}
+
+cat("All UpSet plots have been generated successfully.\n")
+cat("Output directory:", upsetplot_output_dir, "\n")
+
