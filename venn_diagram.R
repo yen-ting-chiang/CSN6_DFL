@@ -393,3 +393,267 @@ v2_targets <- c("FBXW7 Targets", "TRIM21 Targets", "DCAF1 Targets", "BTRC Target
 plot_intersection_heatmap(v2_csv, v2_targets, "Heatmap_Venn2_Intersection", max_width = 4.0)
 
 print("Heatmap generation completed successfully.")
+
+# ============================================================================
+# Bar Chart Generation from Annotation Summary Statistics
+# ============================================================================
+
+# Create barchart directory
+if (!dir.exists("barchart")) {
+  dir.create("barchart")
+}
+
+# Read annotation summary statistics
+ann_stats <- read.csv("region_list/Annotation_Summary_Statistics.csv", 
+                      stringsAsFactors = FALSE, check.names = FALSE)
+
+# Remove "%" from Percentage column and convert to numeric
+ann_stats$Pct_Numeric <- as.numeric(gsub("%", "", ann_stats$Percentage))
+
+# ---- Helper to dynamically get group counts ----
+get_group_size <- function(stats_df, list_name, target_list) {
+  # Sum all categories (including not_target) to get the total genes in the list
+  sum(stats_df$Count[stats_df$List_Name == list_name & stats_df$Target == target_list[1]], na.rm = TRUE)
+}
+
+# ---- Define the mapping from List_Name to readable group labels ----
+
+venn1_lists <- c(
+  "Venn1_prot_up_vs_ub_down_Intersection",
+  "Venn1_prot_up_vs_ub_down_Only_in_prot_up_list",
+  "Venn1_prot_up_vs_ub_down_Only_in_ub_down_list"
+)
+venn1_labels_base <- c("UpP_DownU", "UpP", "DownU")
+venn1_targets <- c("MDM2 Targets", "RFWD2 Targets", "UBE3A Targets")
+
+venn1_groups <- setNames(
+  paste0(venn1_labels_base, " (", sapply(venn1_lists, get_group_size, stats_df = ann_stats, target_list = venn1_targets), ")"),
+  venn1_lists
+)
+
+venn2_lists <- c(
+  "Venn2_prot_down_vs_ub_up_Intersection",
+  "Venn2_prot_down_vs_ub_up_Only_in_prot_down_list",
+  "Venn2_prot_down_vs_ub_up_Only_in_ub_up_list"
+)
+venn2_labels_base <- c("DownP_UpU", "DownP", "UpU")
+venn2_targets <- c("FBXW7 Targets", "TRIM21 Targets", "DCAF1 Targets", "BTRC Targets")
+
+venn2_groups <- setNames(
+  paste0(venn2_labels_base, " (", sapply(venn2_lists, get_group_size, stats_df = ann_stats, target_list = venn2_targets), ")"),
+  venn2_lists
+)
+
+# ---- Define annotation category order and short names (excluding Not Annotated) ----
+cat_order <- c("Known", "HIGH", "MIDDLE", "LOW")
+cat_labels <- c("Known", "High (contain Known)", "Medium", "Low")
+
+# ---- Helper function to create pivot table ----
+create_pivot_table <- function(stats_df, group_map, target_list, value_col) {
+  # Filter for relevant groups and targets, excluding not_target
+  sub_df <- stats_df[stats_df$List_Name %in% names(group_map) & 
+                     stats_df$Target %in% target_list & 
+                     stats_df$Category %in% cat_order, ]
+  
+  # Ensure all categories exist for each row
+  all_rows <- expand.grid(
+    List_Name = names(group_map),
+    Target = target_list,
+    Category = cat_order,
+    stringsAsFactors = FALSE
+  )
+  
+  merged <- merge(all_rows, sub_df[, c("List_Name", "Target", "Category", value_col)], 
+                  by = c("List_Name", "Target", "Category"), all.x = TRUE)
+  merged[[value_col]][is.na(merged[[value_col]])] <- 0
+  
+  # Pivot to wide format
+  result_rows <- list()
+  for (gn in names(group_map)) {
+    for (tgt in target_list) {
+      row_data <- merged[merged$List_Name == gn & merged$Target == tgt, ]
+      vals <- setNames(row_data[[value_col]], row_data$Category)
+      df_row <- data.frame(
+        Group = group_map[gn],
+        Target = gsub(" Targets", "", tgt),
+        stringsAsFactors = FALSE, check.names = FALSE, row.names = NULL
+      )
+      df_row[["Known"]] <- ifelse("Known" %in% names(vals), vals["Known"], 0)
+      df_row[["High (contain Known)"]] <- ifelse("HIGH" %in% names(vals), vals["HIGH"], 0)
+      df_row[["Medium"]] <- ifelse("MIDDLE" %in% names(vals), vals["MIDDLE"], 0)
+      df_row[["Low"]] <- ifelse("LOW" %in% names(vals), vals["LOW"], 0)
+      
+      result_rows[[length(result_rows) + 1]] <- df_row
+    }
+  }
+  
+  do.call(rbind, result_rows)
+}
+
+# ---- Create and export pivot tables ----
+# Count tables
+venn1_count_table <- create_pivot_table(ann_stats, venn1_groups, venn1_targets, "Count")
+venn2_count_table <- create_pivot_table(ann_stats, venn2_groups, venn2_targets, "Count")
+
+write.csv(venn1_count_table, "barchart/Venn1_Summary_Count.csv", row.names = FALSE)
+write.xlsx(venn1_count_table, "barchart/Venn1_Summary_Count.xlsx")
+write.csv(venn2_count_table, "barchart/Venn2_Summary_Count.csv", row.names = FALSE)
+write.xlsx(venn2_count_table, "barchart/Venn2_Summary_Count.xlsx")
+
+# Percentage tables
+venn1_pct_table <- create_pivot_table(ann_stats, venn1_groups, venn1_targets, "Pct_Numeric")
+venn2_pct_table <- create_pivot_table(ann_stats, venn2_groups, venn2_targets, "Pct_Numeric")
+
+write.csv(venn1_pct_table, "barchart/Venn1_Summary_Percentage.csv", row.names = FALSE)
+write.xlsx(venn1_pct_table, "barchart/Venn1_Summary_Percentage.xlsx")
+write.csv(venn2_pct_table, "barchart/Venn2_Summary_Percentage.csv", row.names = FALSE)
+write.xlsx(venn2_pct_table, "barchart/Venn2_Summary_Percentage.xlsx")
+
+# ---- Choose which palettes to plot ----
+# Set this to "ALL" to plot every palette, or specify a vector of palette names
+# e.g., selected_palettes <- c("BP_9_Seq_Red", "BP_10_Seq_Blue")
+selected_palettes <- "ALL"
+
+# ---- Define bright color palettes for bar charts (4 categories) ----
+bar_palettes <- list(
+  # Mixed Colors
+  BP_0_ExcelLike = c("Known" = "#2F5597", "High (contain Known)" = "#ED7D31", "Medium" = "#70AD47", "Low" = "#5B9BD5"),
+  BP_1_Classic   = c("Known" = "#E41A1C", "High (contain Known)" = "#377EB8", "Medium" = "#4DAF4A", "Low" = "#984EA3"),
+  BP_2_Warm      = c("Known" = "#800026", "High (contain Known)" = "#E31A1C", "Medium" = "#FD8D3C", "Low" = "#FFEDA0"),
+  BP_3_Cool      = c("Known" = "#08306B", "High (contain Known)" = "#2171B5", "Medium" = "#6BAED6", "Low" = "#C6DBEF"),
+  BP_4_Neon      = c("Known" = "#4B0082", "High (contain Known)" = "#9400D3", "Medium" = "#FF1493", "Low" = "#FFB6C1"),
+  BP_5_Nature    = c("Known" = "#BC3C29", "High (contain Known)" = "#E64B35", "Medium" = "#4DBBD5", "Low" = "#00A087"),
+  BP_6_Lancet    = c("Known" = "#AD002A", "High (contain Known)" = "#ED0000", "Medium" = "#00468B", "Low" = "#42B540"),
+  BP_7_JAMA      = c("Known" = "#8B5E3C", "High (contain Known)" = "#DF8F44", "Medium" = "#374E55", "Low" = "#00A1D5"),
+  BP_8_Viridis   = c("Known" = "#440154", "High (contain Known)" = "#31688E", "Medium" = "#35B779", "Low" = "#FDE725"),
+  
+  # Sequential (High-to-Low Correlation)
+  BP_9_Seq_Red   = c("Known" = "#67000D", "High (contain Known)" = "#CB181D", "Medium" = "#FB6A4A", "Low" = "#FCAE91"),
+  BP_10_Seq_Blue = c("Known" = "#08306B", "High (contain Known)" = "#2171B5", "Medium" = "#6BAED6", "Low" = "#C6DBEF"),
+  BP_11_Seq_Green= c("Known" = "#00441B", "High (contain Known)" = "#238B45", "Medium" = "#74C476", "Low" = "#C7E9C0"),
+  BP_12_Seq_Purp = c("Known" = "#3F007D", "High (contain Known)" = "#6A51A3", "Medium" = "#9E9AC8", "Low" = "#DADAEB"),
+  BP_13_Seq_Orang= c("Known" = "#7F2704", "High (contain Known)" = "#D94801", "Medium" = "#FD8D3C", "Low" = "#FDD0A2"),
+  
+  # Additional Modern & Multi-Hue Sequential
+  BP_14_Seq_Teal = c("Known" = "#014636", "High (contain Known)" = "#016C59", "Medium" = "#02818A", "Low" = "#67A9CF"),
+  BP_15_Seq_Magma= c("Known" = "#000004", "High (contain Known)" = "#51127C", "Medium" = "#B63679", "Low" = "#FB8861"),
+  BP_16_Seq_Ocean= c("Known" = "#081D58", "High (contain Known)" = "#225EA8", "Medium" = "#41B6C4", "Low" = "#C7E9B4"),
+  BP_17_Seq_Sunset=c("Known" = "#450A5C", "High (contain Known)" = "#9E2A7B", "Medium" = "#ED6954", "Low" = "#F9CB5A"),
+  BP_18_Seq_Earth= c("Known" = "#543005", "High (contain Known)" = "#BF812D", "Medium" = "#DFC27D", "Low" = "#F6E8C3"),
+  BP_19_Seq_Gray = c("Known" = "#000000", "High (contain Known)" = "#525252", "Medium" = "#969696", "Low" = "#D9D9D9"),
+  BP_20_Seq_Pink = c("Known" = "#49006A", "High (contain Known)" = "#7A0177", "Medium" = "#AE017E", "Low" = "#F768A1")
+)
+
+# ---- Helper function to prepare long-format data for bar chart ----
+prepare_bar_data <- function(stats_df, group_map, target_list, value_col) {
+  sub_df <- stats_df[stats_df$List_Name %in% names(group_map) & 
+                     stats_df$Target %in% target_list & 
+                     stats_df$Category %in% cat_order, ]
+  
+  all_combos <- expand.grid(
+    List_Name = names(group_map),
+    Target = target_list,
+    Category = cat_order,
+    stringsAsFactors = FALSE
+  )
+  
+  merged <- merge(all_combos, sub_df[, c("List_Name", "Target", "Category", value_col)], 
+                  by = c("List_Name", "Target", "Category"), all.x = TRUE)
+  merged[[value_col]][is.na(merged[[value_col]])] <- 0
+  
+  merged$Group <- group_map[merged$List_Name]
+  merged$Target_Short <- gsub(" Targets", "", merged$Target)
+  
+  merged$Cat_Label <- cat_labels[match(merged$Category, cat_order)]
+  merged$Cat_Label <- factor(merged$Cat_Label, levels = cat_labels)
+  
+  merged$Group <- factor(merged$Group, levels = unname(group_map))
+  merged$Target_Short <- factor(merged$Target_Short, levels = gsub(" Targets", "", target_list))
+  
+  merged$Value <- merged[[value_col]]
+  
+  merged
+}
+
+# ---- Helper function to plot and save stacked bar charts ----
+plot_bar_charts <- function(stats_df, group_map, target_list, value_col, 
+                            y_label, prefix_name, max_width = 7.5,
+                            palettes_to_use = selected_palettes) {
+  
+  bar_data <- prepare_bar_data(stats_df, group_map, target_list, value_col)
+  
+  n_groups <- length(group_map)
+  n_targets <- length(target_list)
+  
+  # Set dimensions to fixed 3.5x3.0 inches
+  w <- 3.5
+  h <- 3.0
+  
+  if (length(palettes_to_use) == 1 && palettes_to_use == "ALL") {
+    palettes_to_use <- names(bar_palettes)
+  }
+  
+  for (pal_name in palettes_to_use) {
+    if (!pal_name %in% names(bar_palettes)) {
+      warning(paste("Palette", pal_name, "not found. Skipping."))
+      next
+    }
+    
+    p <- ggplot(bar_data, aes(x = Target_Short, y = Value, fill = Cat_Label)) +
+      geom_bar(stat = "identity", position = "stack", width = 0.6) +
+      facet_grid(~ Group, switch = "x", scales = "free_x", space = "free_x") +
+      scale_fill_manual(values = bar_palettes[[pal_name]], drop = FALSE) +
+      theme_minimal() +
+      labs(x = NULL, y = y_label, fill = "") +
+      theme(
+        text = element_text(family = "sans", size = 7, color = "black"),
+        axis.text.x = element_text(family = "sans", size = 7, color = "black", angle = 45, hjust = 1),
+        axis.text.y = element_text(family = "sans", size = 7, color = "black"),
+        axis.title = element_text(family = "sans", size = 7, color = "black"),
+        legend.text = element_text(family = "sans", size = 7, color = "black"),
+        strip.text.x = element_text(family = "sans", size = 7, color = "black", margin = margin(t = 5, b = 5)),
+        strip.placement = "outside",
+        strip.background = element_blank(),
+        panel.spacing = unit(1.5, "lines"),
+        legend.position = "bottom",
+        legend.direction = "horizontal",
+        legend.margin = margin(t = 0, r = 0, b = 0, l = 0),
+        legend.key.size = unit(8, "pt"),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line.x = element_line(color = "black", size = 0.3),
+        # Add slight extra margin to prevent cropping on halved images
+        plot.margin = margin(t = 10, r = 10, b = 10, l = 10, unit = "pt")
+      ) +
+      guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+    
+    # Save TIFF
+    tiff_file <- paste0("barchart/", prefix_name, "_", pal_name, ".tiff")
+    ggsave(filename = tiff_file, plot = p, width = w, height = h, units = "in", 
+           dpi = 300, compression = "lzw", bg = "white")
+    
+    # Save PDF
+    pdf_file <- paste0("barchart/", prefix_name, "_", pal_name, ".pdf")
+    ggsave(filename = pdf_file, plot = p, width = w, height = h, units = "in", bg = "white")
+  }
+}
+
+# ---- Generate bar charts ----
+
+# Venn1: Count
+plot_bar_charts(ann_stats, venn1_groups, venn1_targets, "Count", 
+                "Count", "Venn1_Barchart_Count")
+
+# Venn1: Percentage
+plot_bar_charts(ann_stats, venn1_groups, venn1_targets, "Pct_Numeric", 
+                "Percentage (%)", "Venn1_Barchart_Percentage")
+
+# Venn2: Count
+plot_bar_charts(ann_stats, venn2_groups, venn2_targets, "Count", 
+                "Count", "Venn2_Barchart_Count")
+
+# Venn2: Percentage
+plot_bar_charts(ann_stats, venn2_groups, venn2_targets, "Pct_Numeric", 
+                "Percentage (%)", "Venn2_Barchart_Percentage")
+
+print("Stacked bar chart generation and summary table export completed successfully.")
